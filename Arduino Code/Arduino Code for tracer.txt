@@ -1,0 +1,394 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+
+#include <Wire.h> // library requires for IIC communication
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE); // initialization for the used OLED display
+
+
+char buffer[32]; // helper buffer to construct a string to be displayed
+static const unsigned char image_ir_10px_bits[] U8X8_PROGMEM = {0xfc,0x00,0x02,0x01,0x79,0x02,0x84,0x00,0x30,0x00,0x00,0x00,0x30,0x00,0x58,0x00,0x78,0x00,0xff,0x03};
+static const unsigned char image_SDcardMounted_11x8_bits[] U8X8_PROGMEM = {0xff,0x07,0xff,0x04,0xff,0x07,0xff,0x04,0xff,0x07,0xff,0x04,0xff,0x07,0x67,0x00};
+static const unsigned char image_Battery_26x8_bits[] U8X8_PROGMEM = {0xfe,0xff,0x7f,0x00,0x01,0x00,0x80,0x00,0x01,0x00,0x80,0x03,0x01,0x00,0x80,0x02,0x01,0x00,0x80,0x02,0x01,0x00,0x80,0x03,0x01,0x00,0x80,0x00,0xfe,0xff,0x7f,0x00};
+
+int ammo = 350;
+int usedAmmo = 0;
+char uammo[32];
+int battery = 100;
+char bat[32];
+const int voltageDividerPin = A1; 
+const float voltageDividerRatio = 0.5;
+const int numReadings = 10;
+int sensorValues[numReadings]; // Array to store sensor readings
+int sensorIndex = 0;
+
+const int buttonPin = 2;  // the pin that the pushbutton is attached to
+//bool irSensorState = false;  // variable for reading the IR sensor status
+bool lastButtonState = HIGH;  // the previous state of the button
+unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
+unsigned long debounceDelay = 50;     // variable for debouncing
+
+
+const int irSensorPin = A0; // Assuming you have the sensor output connected to analog pin A0
+const int mosfetPin = 9;     // The pin connected to the MOSFET gate
+bool mosfetState = false;
+
+const int modeButtonPin = 3;  // the pin that the mode button is attached to
+bool lastModeButtonState = HIGH;  // the previous state of the mode button
+unsigned long lastModeButtonDebounceTime = 0;  // the last time the mode button was toggled
+const int flashlightPin = 4; // Pin controlling the flashlight
+
+
+enum Mode {
+  MODE_OFF,
+  MODE_CONSTANT_ON,
+  MODE_ON_IR_DETECTED,
+  MODE_FLASH_ON_IR_DETECTED
+};
+Mode currentMode = MODE_OFF;
+
+void handleModeButton() {
+  int modeButtonReading = digitalRead(modeButtonPin);
+  if (modeButtonReading == LOW && lastModeButtonState == HIGH && (millis() - lastModeButtonDebounceTime) > debounceDelay) {
+    changeMode();
+    displayMode(); // Update the display only when the mode changes
+    lastModeButtonDebounceTime = millis();
+  }
+  lastModeButtonState = modeButtonReading;
+}
+
+void changeMode() {
+  currentMode = static_cast<Mode>((currentMode + 1) % 4); // Cycle through the modes
+}
+
+void displayMode() {
+  // Clear the area where the mode boxes are displayed
+  //u8g2.setDrawColor(0); // Black to erase
+ // u8g2.drawBox(29, 45, 26, 12);
+  //u8g2.drawBox(57, 44, 18, 12);
+  //u8g2.drawBox(86, 44, 26, 12);
+ // u8g2.setDrawColor(1); // White to draw
+
+  // Draw the frame for the mode boxes
+  //u8g2.drawFrame(29, 45, 21, 12);
+ // u8g2.drawFrame(57, 44, 18, 12);
+ // u8g2.drawFrame(86, 44, 26, 12);
+
+  // Fill in the box for the current mode
+  switch (currentMode) {
+    case MODE_CONSTANT_ON:
+      u8g2.drawFrame(29, 45, 21, 12);
+      break;
+    case MODE_ON_IR_DETECTED:
+      u8g2.drawFrame(57, 44, 18, 12);
+      break;
+    case MODE_FLASH_ON_IR_DETECTED:
+      u8g2.drawFrame(86, 44, 26, 12);
+      break;
+    default:
+      break; // No box for MODE_OFF
+  }
+}
+
+void executeCurrentMode() {
+  switch (currentMode) {
+    case MODE_OFF:
+      digitalWrite(flashlightPin, LOW); // Turn off flashlight
+      break;
+    case MODE_CONSTANT_ON:
+      digitalWrite(flashlightPin, HIGH); // Keep flashlight constantly on
+      break;
+    case MODE_ON_IR_DETECTED:
+      if (analogRead(irSensorPin) < 1) { // Replace 'threshold' with your actual threshold value
+        digitalWrite(flashlightPin, HIGH); // Turn on flashlight if IR sensor is triggered
+      } else {
+        digitalWrite(flashlightPin, LOW); // Otherwise, turn off
+      }
+      break;
+    case MODE_FLASH_ON_IR_DETECTED:
+      if (analogRead(irSensorPin) < 1) { // Replace 'threshold' with your actual threshold value
+        // Flash the flashlight on and off
+        digitalWrite(flashlightPin, millis() % 60 < 50); // Change 100 to alter flash speed
+      } else {
+        digitalWrite(flashlightPin, LOW); // Otherwise, turn off
+      }
+      break;
+  }
+}
+
+
+void setup(void) {
+   Serial.begin(9600);
+  u8g2.begin(); // start the u8g2 library
+
+  pinMode(buttonPin, INPUT_PULLUP);  // initialize the button pin as a input with pull-up resistor
+  //pinMode(irSensorState, INPUT); // initialize the IR sensor pin as an output (if needed)
+   
+   pinMode(irSensorPin, INPUT_PULLDOWN);
+  pinMode(mosfetPin, OUTPUT);
+  pinMode(voltageDividerPin, INPUT);
+
+   pinMode(modeButtonPin, INPUT_PULLUP);
+  pinMode(flashlightPin, OUTPUT);
+  displayMode();
+
+    for (int i = 0; i < numReadings; i++) {
+    sensorValues[i] = 0;
+  }
+}
+
+  int getAverageSensorValue() {
+    int total = 0;
+    for (int i = 0; i < numReadings; i++) {
+     total += sensorValues[i];
+  }
+    return total / numReadings;
+  }
+
+
+
+void loop(void) {
+
+
+
+  u8g2.clearBuffer();					// clear the internal memory
+
+   // int rawValue = analogRead(analogPin);
+ // float batteryVoltage = rawValue * (5.0 / 1023.0) / voltageDividerRatio;
+    int voltageValue = analogRead(voltageDividerPin);
+  float voltage = map(voltageValue, 0, 1023, 0, 7.6);
+
+ // Serial.print("Battery Voltage: ");
+ // Serial.print(batteryVoltage);
+  //Serial.println(" V");
+
+    //uv led code aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  // Read the state of the switch into a local variable:
+  int reading = digitalRead(buttonPin);
+
+  // Check to see if you just pressed the button 
+  // (i.e. the input went from HIGH to LOW), and you've waited 
+  // long enough since the last press to ignore any noise:
+  if (reading == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime) > debounceDelay) {
+    // Toggle the state of the IR sensor
+    //irSensorState = !irSensorState;
+     mosfetState = !mosfetState;
+
+    // Update the last debounce time
+    lastDebounceTime = millis();
+  }
+
+  // Save the reading. Next time through the loop, it'll be the lastButtonState:
+  lastButtonState = reading;
+
+  // ... (rest of your existing code to handle the display)
+
+  // Display "ON" or "OFF" based on the state of irSensorState
+  u8g2.setFont(u8g2_font_haxrcorp4089_tr);  // choose a suitable font
+  u8g2.setDrawColor(0); // set draw color to black to clear the previous image
+  u8g2.drawBox(94, 21, 20, 7); // draw a black box to clear the previous text
+  u8g2.setDrawColor(1); // set draw color to white to draw new text
+ // if (mosfetState) {
+ //   u8g2.drawStr(94, 28, "ON ");  // if the MOSFET is ON, display "ON"
+ //   digitalWrite(mosfetPin, HIGH); // Turn on the MOSFET
+ // } else {
+  //  u8g2.drawStr(94, 28, "OFF");  // if the MOSFET is OFF, display "OFF"
+ //   digitalWrite(mosfetPin, LOW); // Turn off the MOSFET
+ // }
+
+  // ... (rest of your existing code to send the buffer to the display)
+
+  // Small delay to prevent bouncing
+  //delay(10);
+
+
+  // uv led code aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+
+  // sensor code for bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+  // int irSensorValue = analogRead(irSensorPin);
+   // total -= sensorValues[sensorIndex];
+    //sensorValues[sensorIndex] = irSensorValue;
+  //total += irSensorValue;
+  // sensorIndex = (sensorIndex + 1) % numReadings;
+  //  int average = total / numReadings;
+
+  // If the sensor value meets the threshold, indicating the beam was broken
+  //if (irSensorValue > 4) { // You need to determine the correct threshold through experimentation
+ //   if (ammo > 0) { // Make sure we don't go below 0
+  //    ammo--; // Decrement the ammo count by one
+ //   }
+    // Small delay to prevent counting the bullet more than once
+    
+  //}
+ // Serial.print("IR Sensor Value: ");
+ // Serial.println(irSensorValue);
+
+    // Read the IR sensor value
+  int irSensorValue = analogRead(irSensorPin);
+  //Serial.println(irSensorValue);
+  digitalWrite(mosfetPin,LOW);
+  if (mosfetState) {
+    // Check if a BB is detected by the IR sensor
+    if (irSensorValue < 1) {
+      //if (!mosfetState ){
+        digitalWrite(mosfetPin,HIGH);
+              if (ammo > 0) { // Make sure we don't go below 0
+                  ammo--; // Decrement the ammo count by one
+                  usedAmmo++;
+                }
+          else{
+              ammo = ammo + 350;
+            }
+      //}
+ 
+    
+
+    }
+
+  }
+    else{
+      if (irSensorValue < 1) {
+               if (ammo > 1) { // Make sure we don't go below 0
+            ammo--; // Decrement the ammo count by one
+            usedAmmo++;
+               }
+            else{
+              ammo = ammo + 350;
+            }
+          }
+      if (mosfetState = false){
+        digitalWrite(mosfetPin,LOW);
+ 
+      }
+    }
+       
+
+  
+
+   if (mosfetState) {
+    u8g2.drawStr(94, 28, "ON ");  // if the MOSFET is ON, display "ON"
+    //digitalWrite(mosfetPin, HIGH); // Turn on the MOSFET
+  } else {
+    u8g2.drawStr(94, 28, "OFF");  // if the MOSFET is OFF, display "OFF"
+    //digitalWrite(mosfetPin, LOW); // Turn off the MOSFET
+  }
+
+
+  // Check if the IR sensor value is 0
+ // if (irSensorValue == 0) {
+    // Turn on the MOSFET
+ // digitalWrite(mosfetPin, HIGH);
+     //   if (ammo > 0) { // Make sure we don't go below 0
+    // ammo--; // Decrement the ammo count by one
+  // }
+
+ // } else {
+    // Turn off the MOSFET
+ //   digitalWrite(mosfetPin, LOW);
+ // }
+    
+
+  //sensor code for bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+
+		int boxHeight = map(ammo, 0, 350, 0, 15);
+  int batteryWidth = map(battery, 0, 100, 0, 22);
+  battery = map(voltageValue, 0, 1023, 0, 100);
+    sensorValues[sensorIndex] = irSensorValue;
+  sensorIndex = (sensorIndex + 1) % numReadings;
+
+	u8g2.setBitmapMode(1);
+	u8g2.setFont(u8g2_font_haxrcorp4089_tr);
+	sprintf(buffer, "Ammo %d", ammo);
+	u8g2.drawStr(15, 12, buffer);
+	//u8g2.drawBox(3, 2, 100, 15); //ammo box
+	//u8g2.drawBox(3, 2, 7, boxHeight);
+	u8g2.drawBox(3, 2 + (7 - boxHeight), 7, boxHeight);
+	u8g2.setFont(u8g2_font_haxrcorp4089_tr);
+
+	u8g2.drawStr(4, 27, "Wasted Ammo");
+	u8g2.drawFrame(1, 29, 42, 11);
+	u8g2.setFont(u8g2_font_haxrcorp4089_tr);
+
+	//u8g2.drawStr(3, 38, "100 RPM");
+  sprintf(uammo, "%d", usedAmmo);
+	u8g2.drawStr(3, 38, uammo);
+
+
+  u8g2.drawStr(15, 12, buffer);
+
+	u8g2.drawLine(0, 41, 63, 41);
+	u8g2.drawLine(64, 41, 64, 0);
+
+
+	u8g2.drawXBMP( 74, 21, 10, 10, image_ir_10px_bits);
+	//u8g2.drawBox(94, 21, 20, 7);
+
+
+	u8g2.drawXBMP( 11, 47, 11, 8, image_SDcardMounted_11x8_bits);
+	//u8g2.drawXBMP( 68, 2, 26, 8, image_Battery_26x8_bits);
+	u8g2.setFont(u8g2_font_haxrcorp4089_tr);
+	//sprintf(bat, "%d%%", battery);
+
+	sprintf(bat, "%d%%", max(0, battery));
+	u8g2.drawStr(99, 9, bat); //battery percent
+
+	u8g2.drawXBMP( 68, 2, 26, 8, image_Battery_26x8_bits);
+	//u8g2.drawBox(69, 3, 22, 6);// battery bar
+	 u8g2.drawBox(69, 3, batteryWidth, 6);
+
+	//u8g2.drawBox(0, 48, batteryWidth, 8);
+	u8g2.drawLine(65, 12, 128, 12);
+	u8g2.drawFrame(32, 47, 15, 8);
+	u8g2.drawXBMP( 61, 45, 10, 10, image_ir_10px_bits);
+	u8g2.drawXBMP( 88, 45, 10, 10, image_ir_10px_bits);
+	u8g2.drawXBMP( 100, 45, 10, 10, image_ir_10px_bits);
+
+
+	//u8g2.drawFrame(29, 45, 21, 12);
+	//u8g2.drawFrame(57, 44, 18, 12);
+	//u8g2.drawFrame(86, 44, 26, 12);
+  handleModeButton(); // Check for mode button press and change mode if necessary
+  executeCurrentMode(); // Execute actions based on current mode
+
+   int modeButtonReading = digitalRead(modeButtonPin);
+   if (modeButtonReading == LOW && lastModeButtonState == HIGH && (millis() - lastModeButtonDebounceTime) > debounceDelay) {
+    changeMode();
+    displayMode(); // Update the display to show the current mode
+    lastModeButtonDebounceTime = millis();
+  }
+  lastModeButtonState = modeButtonReading;
+  
+  executeCurrentMode();
+    switch (currentMode) {
+    case MODE_CONSTANT_ON:
+      u8g2.drawFrame(29, 45, 21, 12); // Fill the first box for constant on mode
+      break;
+    case MODE_ON_IR_DETECTED:
+      u8g2.drawFrame(57, 44, 18, 12); // Fill the second box for IR detected mode
+      break;
+    case MODE_FLASH_ON_IR_DETECTED:
+      u8g2.drawFrame(86, 44, 26, 12); // Fill the third box for flash mode
+      break;
+    case MODE_OFF:
+    default:
+      // Don't fill any boxes for off mode
+      break;
+  }
+
+	//u8g2.drawBox(69, 3, 22, 6);
+	//ammo = max(0, ammo - 1);
+	
+	//battery = max(0, battery - 1);
+
+	
+
+
+  u8g2.sendBuffer();
+	delay(10);					// transfer internal memory to the display
+  
+  // increase the progress value to go over 0-100
+	
+}
